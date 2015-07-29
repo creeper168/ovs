@@ -53,6 +53,7 @@
 #include "rte_config.h"
 #include "rte_mbuf.h"
 #include "rte_virtio_net.h"
+#include "rte_kni.h"
 
 VLOG_DEFINE_THIS_MODULE(dpdk);
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
@@ -229,6 +230,8 @@ struct netdev_dpdk {
 
     /* In dpdk_list. */
     struct ovs_list list_node OVS_GUARDED_BY(dpdk_mutex);
+
+    struct rte_kni * kni;
 };
 
 struct netdev_rxq_dpdk {
@@ -684,6 +687,8 @@ netdev_dpdk_destruct(struct netdev *netdev_)
     list_remove(&dev->list_node);
     dpdk_mp_put(dev->dpdk_mp);
     ovs_mutex_unlock(&dpdk_mutex);
+    if(dev->kni)
+        rte_kni_release(dev->kni);
 }
 
 static void
@@ -924,6 +929,25 @@ netdev_dpdk_vhost_rxq_recv(struct netdev_rxq *rxq_,
     rte_spinlock_unlock(&vhost_dev->stats_lock);
 
     *c = (int) nb_rx;
+    return 0;
+}
+
+static int
+netdev_dpdk_rxq_recv2(struct netdev_rxq *rxq_, struct dp_packet **packets,
+                     int *c)
+{
+    struct netdev_rxq_dpdk *rx = netdev_rxq_dpdk_cast(rxq_);
+    struct netdev *netdev = rx->up.netdev;
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    int nb_rx;
+
+    nb_rx = rte_kni_rx_burst(dev->kni, (struct rte_mbuf **) packets, NETDEV_MAX_BURST);
+    if (!nb_rx) {
+        return EAGAIN;
+    }
+
+    *c = nb_rx;
+
     return 0;
 }
 
@@ -1872,7 +1896,7 @@ dpdk_ring_open(const char dev_name[], unsigned int *eth_port_id) OVS_REQUIRES(dp
     /* Need to create the device rings */
     return dpdk_ring_create(dev_name, port_no, eth_port_id);
 }
-
+#if 0
 static int
 netdev_dpdk_ring_send(struct netdev *netdev_, int qid,
                       struct dp_packet **pkts, int cnt, bool may_steal)
@@ -1887,15 +1911,96 @@ netdev_dpdk_ring_send(struct netdev *netdev_, int qid,
     for (i = 0; i < cnt; i++) {
         dp_packet_set_rss_hash(pkts[i], 0);
     }
-
     netdev_dpdk_send__(netdev, qid, pkts, cnt, may_steal);
     return 0;
+}
+#endif
+
+static int
+netdev_dpdk_ring_send2(struct netdev *netdev_, int qid,
+                      struct dp_packet **pkts, int cnt, bool may_steal)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);
+    unsigned i;
+    (void)qid;
+    (void)may_steal;
+
+    /* When using 'dpdkr' and sending to a DPDK ring, we want to ensure that the
+     * rss hash field is clear. This is because the same mbuf may be modified by
+     * the consumer of the ring and return into the datapath without recalculating
+     * the RSS hash. */
+    for (i = 0; i < cnt; i++) {
+        dp_packet_set_rss_hash(pkts[i], 0);
+    }
+    if((netdev->kni)&&(pkts[0]->source == DPBUF_DPDK))
+    {
+        int ct; 
+        rte_kni_handle_request(netdev->kni);
+        ct = rte_kni_tx_burst(netdev->kni,(struct rte_mbuf **) pkts,cnt);
+        netdev->stats.tx_dropped += cnt - ct;
+    }
+    return 0;
+}
+
+/* Callback for request of configuring network interface up/down */
+static int
+kni_config_network_interface(uint8_t port_id, uint8_t if_up)
+{
+        int ret = 0;
+
+        if (port_id >= rte_eth_dev_count() || port_id >= RTE_MAX_ETHPORTS) {
+                VLOG_INFO("Invalid port id %d\n", port_id);
+                return -EINVAL;
+        }
+
+        VLOG_INFO("Configure network interface of %d %s\n",
+                                        port_id, if_up ? "up" : "down");
+
+        if (if_up != 0) { /* Configure network interface up */
+                rte_eth_dev_stop(port_id);
+                ret = rte_eth_dev_start(port_id);
+        } else /* Configure network interface down */
+                rte_eth_dev_stop(port_id);
+
+        if (ret < 0)
+                VLOG_INFO("Failed to start port %d\n", port_id);
+
+        return ret;
+}
+
+
+
+static struct rte_kni *
+dpdk_kni_create(uint8_t port_id,
+               unsigned mbuf_size,
+               struct rte_mempool *pktmbuf_pool)
+{
+    struct rte_kni_conf conf;
+    struct rte_eth_dev_info info;
+	struct rte_kni_ops ops;
+
+	memset(&ops, 0, sizeof(ops));
+	ops.port_id = port_id;
+	ops.config_network_if = kni_config_network_interface;
+
+    memset(&info, 0, sizeof(info));
+    memset(&conf, 0, sizeof(conf));
+    rte_eth_dev_info_get(port_id, &info);
+
+    snprintf(conf.name, sizeof(conf.name), "vEth%u", port_id);
+    conf.addr = info.pci_dev->addr;
+    conf.id = info.pci_dev->id;
+    conf.group_id = (uint16_t)port_id;
+    conf.mbuf_size = mbuf_size;
+
+    return rte_kni_alloc(pktmbuf_pool, &conf, NULL);
 }
 
 static int
 netdev_dpdk_ring_construct(struct netdev *netdev)
 {
     unsigned int port_no = 0;
+	struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
     int err = 0;
 
     if (rte_eal_init_ret) {
@@ -1910,6 +2015,14 @@ netdev_dpdk_ring_construct(struct netdev *netdev)
     }
 
     err = netdev_dpdk_init(netdev, port_no, DPDK_DEV_ETH);
+    VLOG_INFO("%s use eth port id: %d", netdev->name, port_no);
+    if(!err)
+    {
+        dev->kni = dpdk_kni_create(port_no,2048,dev->dpdk_mp->mp);
+        if(!(dev->kni))
+            VLOG_INFO("create kni port failed for %s",netdev->name);
+    }
+    
 
 unlock_dpdk:
     ovs_mutex_unlock(&dpdk_mutex);
@@ -2069,6 +2182,7 @@ dpdk_init(int argc, char **argv)
         argv[result] = argv[0];
     }
 
+    rte_kni_init(1);
     /* We are called from the main thread here */
     RTE_PER_LCORE(_lcore_id) = NON_PMD_CORE_ID;
 
@@ -2096,12 +2210,12 @@ static const struct netdev_class dpdk_ring_class =
         netdev_dpdk_ring_construct,
         netdev_dpdk_destruct,
         netdev_dpdk_set_multiq,
-        netdev_dpdk_ring_send,
+        netdev_dpdk_ring_send2,
         netdev_dpdk_get_carrier,
         netdev_dpdk_get_stats,
         netdev_dpdk_get_features,
         netdev_dpdk_get_status,
-        netdev_dpdk_rxq_recv);
+        netdev_dpdk_rxq_recv2);
 
 static const struct netdev_class OVS_UNUSED dpdk_vhost_cuse_class =
     NETDEV_DPDK_CLASS(
